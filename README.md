@@ -1,4 +1,11 @@
 > **Fork note:** This is a fork of [brainstormity/Jev-X-Sentiment-Analysis](https://github.com/brainstormity/Jev-X-Sentiment-Analysis) — the original Jev X sentiment analysis tool by [@brainstormity](https://github.com/brainstormity), powered by TypeSafe AI's Jev model. All credit for the base tool belongs to the original author. This fork layers a twice-daily market-brief pipeline on top (see `market-brief/`).
+>
+> **Stocks & ETFs, not just crypto:** the brief covers crypto daily (BTC, ETH, SOL, HYPE, NEAR)
+> and stocks/ETFs on weekdays (SMH, DRAM, COIN, HOOD, BE). Crypto market data comes from Kraken
+> public REST; stock prices come from free public quote data passed via `--price` — no paid feed
+> or TradingView account needed. Stock X queries are cashtag-only (e.g. `$DRAM`). Every layer
+> in `market-brief/` (author priors, quote-tweet handling, falsifiers, hit-rate) works identically
+> for both.
 
 ---
 # Jev X Sentiment Analysis
