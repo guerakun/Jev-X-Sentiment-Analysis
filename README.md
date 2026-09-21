@@ -1,3 +1,6 @@
+> **Fork note:** This is a fork of [brainstormity/Jev-X-Sentiment-Analysis](https://github.com/brainstormity/Jev-X-Sentiment-Analysis) — the original Jev X sentiment analysis tool by [@brainstormity](https://github.com/brainstormity), powered by TypeSafe AI's Jev model. All credit for the base tool belongs to the original author. This fork layers a twice-daily market-brief pipeline on top (see `market-brief/`).
+
+---
 # Jev X Sentiment Analysis
 
 ![Jev X Sentiment Analysis](public/images/frontend.jpeg)
