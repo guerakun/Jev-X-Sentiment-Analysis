@@ -760,26 +760,34 @@ def build_calls(sample: list[dict], priors: dict, sym: str) -> list[dict]:
     return calls
 
 
-def build_falsifier(action: str, sym: str, market: dict, levels: dict) -> str:
+def build_falsifier(action: str, sym: str, market: dict, levels: dict,
+                    analyzed_at: int) -> str:
     """muchi's falsifier: the kill condition for this verdict, generated from
-    the actual verdict and trade levels. (v1.1: template-grounded; v1.2:
-    model-written free text.)"""
+    the actual verdict and trade levels — with its own clock. The falsifier
+    expires at the settle pass (analyzed_at + SETTLE_MIN_AGE_H); untriggered
+    at settle = verdict dies, miss logged, habit named. (v1.1:
+    template-grounded; v1.2: model-written free text.)"""
     lo, hi = levels["entry_range"]
     sl = levels["stop_loss"]
     if action in ("STRONG_BUY", "BUY"):
-        return (f"This would change my mind: {sym} breaks below ${sl} on rising "
+        core = (f"This would change my mind: {sym} breaks below ${sl} on rising "
                 f"volume, or the next 50-post sample flips to fear (polarity < -0.3) "
                 f"on fresh negative catalysts.")
-    if action in ("SELL", "STRONG_SELL"):
-        return (f"This would change my mind: {sym} reclaims ${hi} with funding "
+    elif action in ("SELL", "STRONG_SELL"):
+        core = (f"This would change my mind: {sym} reclaims ${hi} with funding "
                 f"flipping positive and the next sample staying greedy (polarity > 0.3) "
                 f"without new negative catalysts.")
-    if action == "TAKE_PROFIT":
-        return (f"This would change my mind: {sym} consolidates above ${hi} for 48h+ "
+    elif action == "TAKE_PROFIT":
+        core = (f"This would change my mind: {sym} consolidates above ${hi} for 48h+ "
                 f"with RSI cooling under 60 — the overbought read expires and the "
                 f"uptrend resumes.")
-    return (f"This would change my mind: a decisive break of ${lo}-${hi} in either "
-            f"direction on >2x average volume, or a major catalyst in the next sample.")
+    else:
+        core = (f"This would change my mind: a decisive break of ${lo}-${hi} in either "
+                f"direction on >2x average volume, or a major catalyst in the next sample.")
+    expires = time.strftime("%Y-%m-%d %H:%M UTC",
+                            time.gmtime(analyzed_at + SETTLE_MIN_AGE_H * 3600))
+    return (f"{core} [Expires {expires} (settle): untriggered at settle = "
+            f"verdict dies, miss logged, habit named.]")
 
 
 def append_hit_rate_row(row: dict) -> None:
@@ -817,6 +825,9 @@ def settle_hit_rate(settle_prices: dict) -> dict:
     --settle-prices (same free public quote data the main run uses via
     --price); symbols without a settle price are skipped, never guessed.
     Misses are labeled in place: they become the training set for round two.
+    Settling a row also closes its falsifier's clock — the row was written
+    with falsifier_expires_at, and at settle the falsifier is marked expired:
+    untriggered at settle = verdict dies, miss logged, habit named.
     """
     rows = load_hit_rate_rows()
     if not rows:
@@ -844,7 +855,12 @@ def settle_hit_rate(settle_prices: dict) -> dict:
             "actual_direction": actual,
             "hit": hit,
             "is_miss": not hit,
+            # muchi's clock: the falsifier expires at settle. Untriggered =
+            # verdict dies; misses get their habit named for the training set.
+            "falsifier_expired": True,
         })
+        if not hit:
+            r["miss_habit"] = f"{r.get('predicted_action')}->{actual}"
         settled += 1
         hits += 1 if hit else 0
     save_hit_rate_rows(rows)
@@ -932,16 +948,20 @@ def main() -> None:
     # v1.1: fold this run into the rolling priors AFTER scoring.
     update_author_priors(priors, sym, tw["tweets"])
 
-    falsifier = build_falsifier(decision["action"], sym, market, decision["trade_levels"])
+    analyzed_at = int(time.time())
+    falsifier = build_falsifier(decision["action"], sym, market,
+                                decision["trade_levels"], analyzed_at)
     hit_row = {
         "date": time.strftime("%Y-%m-%d"),
-        "analyzed_at": int(time.time()),
+        "analyzed_at": analyzed_at,
         "symbol": sym,
         "predicted_action": decision["action"],
         "predicted_direction": DIRECTION_OF.get(decision["action"], "flat"),
         "price_at_call": market["price"],
         "confidence_pct": decision["confidence_pct"],
         "falsifier": falsifier,
+        # muchi's clock: the falsifier dies at the settle pass.
+        "falsifier_expires_at": analyzed_at + SETTLE_MIN_AGE_H * 3600,
     }
     append_hit_rate_row(hit_row)
 
