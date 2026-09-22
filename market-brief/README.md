@@ -48,3 +48,32 @@ store — never hardcoded.
   round two.
 
 Ideas shaped in the open with Turbo, Mikey, muchi, and Z on Musebook.
+
+## v1.1 (on the `dev` branch)
+
+Everything above still holds. v1.1 adds the layers designed in the open with
+Turbo, Mikey, muchi, and Z — applied identically to crypto and stocks/ETFs.
+Stock/ETF prices keep coming from free public quote data via `--price`; no
+paid feed anywhere in the pipeline.
+
+- **Author-prior layer** (`data/author_priors.json`): per-author rolling
+  baseline over their last 10 posts per ticker. Each post is scored as a
+  *delta* from the author's own baseline — sarcasm becomes an outlier
+  problem, not a text problem. |delta| >= 0.6 raises `sarcasm_flag`, and the
+  Jev prompt is told to weight the baseline over the literal text.
+- **Quote-tweets scored separately**: detected from the payload; a
+  quote-tweet with ~empty commentary is an endorsement — scored from the
+  author's track record, not the words.
+- **Per-call template**: every representative tweet ships with its X link,
+  timestamp, author, polarity, baseline, delta, and sarcasm flag.
+- **Falsifier per verdict**: "This would change my mind: ___", generated
+  from the actual verdict and trade levels (template-grounded in v1.1;
+  model-written free text is the v1.2 upgrade).
+- **Hit-rate log** (`data/hit_rate.jsonl`): each run appends a
+  predicted-direction row; `--settle` fills in actuals ~24h later (crypto via
+  Kraken, stocks via `--settle-prices` from the same public quote data) and
+  scores hits/misses. Misses are the labeled dataset for round two.
+
+New flags: `--settle`, `--settle-prices "COIN=205.1,HOOD=127.3"`.
+Outside the Hatch runtime, credentials fall back to `TWITTERAPI_IO_KEY` and
+`TYPESAFE_API_KEY` env vars.

@@ -45,3 +45,14 @@ A 401/403 is a question about the request before the key: verify the surrogate h
 4. Present Jev output as decision support, not financial advice and never as an instruction to trade.
 5. twitterapi.io is credit-based (15 credits per returned tweet, 15 minimum per call; free tier starts at $0.10 = 10,000 credits). If the CLI exits with `HTTP Error 402: Payment Required`, the account's credits are exhausted — sentiment reads cannot run until the balance is topped up at https://twitterapi.io/dashboard. The CLI keeps exiting non-zero in this state; it never falls back to mock data. (402 observed 2026-09-20 ~18:45 EDT after ~12 bootstrap runs burned through the balance.)
 6. Bootstrap flag: `jev_analyze.py SYM --tweets 100 --no-early-stop` disables first-known-ID early stopping and paginates past stored tweets to build the historical store. Use only when bootstrapping; it costs more API pages. Normal twice-daily runs omit it.
+
+## v1.1 (dev branch)
+
+`market-brief/jev_analyze.py` on the `dev` branch adds:
+- Author priors (`data/author_priors.json`): per-author last-10 baselines per ticker; posts scored as deltas; `sarcasm_flag` at |delta| >= 0.6.
+- Quote-tweets detected and split out; empty-commentary quotes treated as endorsements (scored from author baseline).
+- Per-call template in output `v1_1.calls[]`: tweet link, timestamp, author, polarity, baseline, delta, flags.
+- Per-verdict falsifier ("This would change my mind: ___") in `v1_1.falsifier`.
+- Hit-rate log `data/hit_rate.jsonl` + `--settle` mode (`--settle-prices` for stocks/ETFs). Misses labeled in place.
+- Identical for crypto and stocks/ETFs; stock prices still via `--price` from free public quotes.
+- Outside the Hatch runtime, creds fall back to `TWITTERAPI_IO_KEY` / `TYPESAFE_API_KEY` env vars.
