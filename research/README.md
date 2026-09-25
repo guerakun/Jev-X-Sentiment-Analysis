@@ -34,3 +34,16 @@ The Pine runtime used by this directory (LuxAlgo PineTS / pinets-cli) is
    hit-rate log, not backtest aesthetics.
 2. Closed bars only. No repainting inputs to the decision.
 3. Features are **context for the Jev model**, never standalone signals.
+
+## Validation log
+
+- 2026-09-25: `pinets-cli@0.1.15` ran `research.pine` over 721 real Kraken
+  XBTUSD 4h bars via `--data bars.json`. All 8 plots returned values:
+  ATR=971.37, Supertrend=86903.79, TrendDir=1, SwingHigh=87274.40,
+  SwingLow=82832.30, CMF=-0.0757, BOS_Up=0, BOS_Down=0.
+- TrendDir sign convention confirmed empirically: price below the Supertrend
+  line returned dir=1 (downtrend); dir<0 = uptrend, matching the comment in
+  `research.pine`.
+- Note: when extracting features, skip the last bar of Kraken OHLC (forming
+  interval) — or better, drop it before invoking the CLI (timeframe-aware).
+- Stooq daily CSV check for stock bars: pending.
