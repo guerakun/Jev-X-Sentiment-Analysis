@@ -37,6 +37,25 @@ separate process — .pine in, JSON out; never imported):
   3. Stocks/ETFs get a real daily RSI-14 (was hardcoded 50.0).
 Real funding rates remain estimated in v1.2a (v1.2b workstream).
 
+v1.2b adds real keyless funding rates for crypto (BTC, ETH, SOL, HYPE, NEAR):
+  1. fetch_funding_rate(): Binance /fapi/v1/fundingRate (official, keyless)
+     first — geo-blocked here (HTTP 451), no evasion attempted, falls through
+     on any failure — then Hyperliquid metaAndAssetCtxs (keyless POST;
+     hourly decimal normalized to %/8h, the Binance convention), then the
+     v1.2a change-based estimate as fallback. JEV_FUNDING_DISABLE=1 forces
+     the estimated path (for testing).
+  2. Every market dict carries funding provenance: funding_rate_pct,
+     funding_source (binance|hyperliquid|estimated|none), funding_asof,
+     funding_age_s, funding_estimated. Stocks/ETFs stay neutral (0.0, no
+     perps exist for them).
+  3. Jev market context now includes funding provenance so the model weighs
+     real venue funding over estimates; the squeeze question is told to
+     discount estimated funding.
+  4. Deterministic funding squeeze overlay (real funding only): deeply
+     negative funding (<= -0.05%/8h, crowded shorts) floors squeeze_risk_pct
+     at 65 with an explanatory note; extremely positive funding (>=
+     +0.10%/8h, crowded longs) records a long-squeeze warning note.
+
 Pipeline (unchanged from v1.0):
   1. Market data: direct Kraken public REST for crypto (urllib, no key):
      price, 24h change, RSI-14, volume, estimated funding rate. For stocks/
@@ -68,6 +87,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -465,6 +485,139 @@ def kraken_price(sym: str):
         return None
 
 
+# ---------------------------------------------------------------- v1.2b: real keyless funding rates
+
+BINANCE_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
+HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
+
+# Squeeze-overlay thresholds. funding_rate_pct is percent per 8h (the Binance
+# convention); Hyperliquid's hourly decimal is normalized to it (*800).
+FUNDING_CROWDED_SHORTS_PCT = -0.05  # deeply negative: shorts are crowded
+FUNDING_CROWDED_LONGS_PCT = 0.10    # extremely positive: longs are crowded
+
+
+def estimate_funding(change_24h: float) -> float:
+    """v1.2a heuristic, kept as the fallback when no venue is reachable."""
+    return 0.010 if change_24h > 3 else (-0.015 if change_24h < -3 else 0.005)
+
+
+def _funding_result(rate_pct: float, source: str, asof: int | None,
+                    estimated: bool) -> dict:
+    now = int(time.time())
+    return {
+        "rate_pct": round(rate_pct, 4),
+        "source": source,
+        "asof": asof,
+        "age_s": max(0, now - asof) if asof else None,
+        "estimated": estimated,
+    }
+
+
+def _estimated_funding(change_24h: float) -> dict:
+    return _funding_result(estimate_funding(change_24h), "estimated", None, True)
+
+
+def fetch_funding_rate(sym: str, change_24h: float) -> dict:
+    """Real keyless perp funding for a crypto symbol. Never dies.
+
+    Tries Binance official futures funding first (keyless; geo-blocked from
+    this egress with HTTP 451 — no evasion attempted, any failure falls
+    through), then Hyperliquid's keyless info API (metaAndAssetCtxs), then
+    the v1.2a change-based estimate. Returns rate_pct (%/8h) plus provenance
+    metadata. JEV_FUNDING_DISABLE=1 forces the estimated path (testing).
+    """
+    if os.environ.get("JEV_FUNDING_DISABLE") == "1":
+        return _estimated_funding(change_24h)
+    try:
+        qs = urllib.parse.urlencode({"symbol": f"{sym}USDT", "limit": 1})
+        req = urllib.request.Request(f"{BINANCE_FUNDING_URL}?{qs}")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read().decode("utf-8"))
+        if isinstance(rows, list) and rows:
+            # Binance fundingRate is a decimal per 8h period -> percent.
+            rate = float(rows[0]["fundingRate"]) * 100.0
+            asof = int(rows[0].get("fundingTime", 0) // 1000) or int(time.time())
+            return _funding_result(rate, "binance", asof, False)
+    except Exception:
+        pass  # officially unreachable/blocked: fall through, never circumvent
+    try:
+        meta, ctxs = _hyperliquid_post({"type": "metaAndAssetCtxs"})
+        # Asset names live in meta.universe[i], aligned by index with ctxs[i].
+        names = [u.get("name", "").upper() for u in meta.get("universe", [])]
+        now = int(time.time())
+        for name, ctx in zip(names, ctxs):
+            if name == sym and ctx.get("funding") is not None:
+                # Hyperliquid funding is an hourly decimal; normalize to
+                # percent per 8h: hourly * 100 * 8.
+                return _funding_result(float(ctx["funding"]) * 800.0,
+                                       "hyperliquid", now, False)
+    except Exception:
+        pass
+    return _estimated_funding(change_24h)
+
+
+def _hyperliquid_post(payload: dict, timeout: int = 25) -> tuple:
+    """POST to Hyperliquid's keyless info API.
+
+    The response is large (~72KB) and Python's urllib frequently sees it
+    truncated mid-read through the egress proxy (http.client.IncompleteRead),
+    while curl fetches the same route reliably — so: a few urllib attempts
+    first (pure stdlib), then curl via subprocess, else raise and let the
+    caller fall back to estimated funding.
+    """
+    body = json.dumps(payload).encode()
+    last_err: Exception | None = None
+    for _ in range(3):
+        try:
+            req = urllib.request.Request(
+                HYPERLIQUID_INFO_URL, data=body, method="POST",
+                headers={"Content-Type": "application/json",
+                         "Connection": "close"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:  # noqa: BLE001 — retry, then try curl
+            last_err = e
+    curl = shutil.which("curl")
+    if curl:
+        for _ in range(2):
+            try:
+                p = subprocess.run(
+                    [curl, "-s", "-m", str(timeout), "-X", "POST",
+                     HYPERLIQUID_INFO_URL,
+                     "-H", "Content-Type: application/json",
+                     "-d", body],
+                    capture_output=True, timeout=timeout + 5)
+                if p.returncode == 0 and p.stdout:
+                    return json.loads(p.stdout.decode("utf-8"))
+                last_err = RuntimeError(f"curl rc={p.returncode}")
+            except Exception as e:  # noqa: BLE001 — retry, then give up
+                last_err = e
+    raise RuntimeError(f"hyperliquid info failed: {last_err}")
+
+
+def apply_funding_squeeze_overlay(squeeze_risk_pct: float,
+                                  market: dict) -> tuple[float, str | None]:
+    """v1.2b deterministic overlay on the model's squeeze read.
+
+    Real funding only — never the estimate (it's derived from the 24h price
+    change, so it would double-count momentum). Returns
+    (adjusted_pct, note_or_None).
+    """
+    if market.get("funding_estimated", True):
+        return squeeze_risk_pct, None
+    f = market.get("funding_rate_pct", 0.0) or 0.0
+    src = market.get("funding_source", "unknown")
+    if f <= FUNDING_CROWDED_SHORTS_PCT:
+        return max(squeeze_risk_pct, 65.0), (
+            f"deeply negative real funding ({f:.3f}%/8h via {src}): crowded "
+            "shorts — short-squeeze risk elevated")
+    if f >= FUNDING_CROWDED_LONGS_PCT:
+        return squeeze_risk_pct, (
+            f"extremely positive real funding ({f:.3f}%/8h via {src}): crowded "
+            "longs — long-squeeze (downside cascade) risk elevated")
+    return squeeze_risk_pct, None
+
+
 def fetch_market(symbol: str) -> dict:
     """Market data via Kraken public REST (no key). urllib honors the egress proxy."""
     sym = symbol.upper().replace("$", "")
@@ -491,7 +644,8 @@ def fetch_market(symbol: str) -> dict:
         closes = [float(c[4]) for c in odata["result"][okey][-48:]]
         rsi = calculate_rsi(closes, 14)
 
-        funding = 0.010 if change_24h > 3 else (-0.015 if change_24h < -3 else 0.005)
+        # v1.2b: real keyless funding (Binance -> Hyperliquid -> estimate).
+        fi = fetch_funding_rate(sym, change_24h)
 
         # v1.2a: Pine research layer over Kraken 4h bars (closed bars only —
         # Kraken's last OHLC candle is the forming interval, so drop it).
@@ -517,7 +671,11 @@ def fetch_market(symbol: str) -> dict:
             "low_24h": round(low_24h, 2),
             "volume_24h_usd": round(volume_24h, 0),
             "rsi_14": rsi,
-            "funding_rate_pct": round(funding, 4),
+            "funding_rate_pct": fi["rate_pct"],
+            "funding_source": fi["source"],
+            "funding_asof": fi["asof"],
+            "funding_age_s": fi["age_s"],
+            "funding_estimated": fi["estimated"],
             "research": research,
             "is_fallback": False,
             "source": "kraken",
@@ -743,6 +901,11 @@ def typesafe_evaluate(symbol: str, market: dict, stats: dict, calls: list[dict])
             "change_24h_pct": market["change_24h_pct"],
             "rsi_14": market["rsi_14"],
             "funding_rate_pct": market["funding_rate_pct"],
+            # v1.2b: funding provenance — the model should weigh real venue
+            # funding (funding_estimated=false) well above the estimate.
+            "funding_source": market.get("funding_source", "estimated"),
+            "funding_estimated": market.get("funding_estimated", True),
+            "funding_age_s": market.get("funding_age_s"),
             "volume_24h_usd": market["volume_24h_usd"],
             # v1.2a: Pine research features as *context* (never signals):
             # atr_pct = ATR as % of price, trend from Supertrend,
@@ -770,7 +933,11 @@ def typesafe_evaluate(symbol: str, market: dict, stats: dict, calls: list[dict])
                 "across `sample_size` tweets, what is the best immediate trading action for `asset`? "
                 "When `market.research` is present, its Pine-derived features (atr_pct, trend, "
                 "cmf_20, rsi, bos) are volatility/structure CONTEXT for sizing risk — not "
-                "standalone trade signals; weigh them well below social + price evidence."
+                "standalone trade signals; weigh them well below social + price evidence. "
+                "v1.2b: `market.funding_rate_pct` is real venue funding when "
+                "`market.funding_estimated` is false (see `funding_source`); weigh it "
+                "seriously. When funding is estimated, treat it as a rough "
+                "momentum proxy and weigh it lightly."
             ) + author_guidance,
             "criteria": {
                 "STRONG_BUY": "High-conviction long (e.g. short squeeze setup, capitulation bottom, or major verified breakout).",
@@ -796,7 +963,10 @@ def typesafe_evaluate(symbol: str, market: dict, stats: dict, calls: list[dict])
             "type": "noul",
             "instructions": (
                 "Does the state show negative `market.funding_rate_pct` clashing with "
-                "`social_stats.sentiment_label` panic at support, indicating a short squeeze risk?"
+                "`social_stats.sentiment_label` panic at support, indicating a short squeeze risk? "
+                "v1.2b: when `market.funding_estimated` is true, funding is a rough "
+                "momentum proxy — discount it. When false, `funding_source` names the "
+                "real venue and deeply negative funding is strong evidence of crowded shorts."
             ),
         },
         "catalyst_impact": {
@@ -1160,6 +1330,10 @@ def main() -> None:
             "volume_24h_usd": 0,
             "rsi_14": rsi_14,
             "funding_rate_pct": 0.0,
+            "funding_source": "none",  # v1.2b: no perps exist for spot equities
+            "funding_asof": None,
+            "funding_age_s": None,
+            "funding_estimated": False,
             "research": research,
             "is_fallback": False,
             "source": "provided",
@@ -1176,6 +1350,12 @@ def main() -> None:
     decision = typesafe_evaluate(sym, market, stats, calls)
     decision["trade_levels"] = build_levels(decision["action"], market["price"],
                                             market.get("research"))
+
+    # v1.2b: deterministic funding squeeze overlay (real funding only).
+    decision["squeeze_risk_pct"], funding_note = apply_funding_squeeze_overlay(
+        decision["squeeze_risk_pct"], market)
+    if funding_note:
+        decision["funding_squeeze_note"] = funding_note
 
     # v1.1: fold this run into the rolling priors AFTER scoring.
     update_author_priors(priors, sym, tw["tweets"])
@@ -1199,7 +1379,7 @@ def main() -> None:
 
     out = {
         "ok": True,
-        "version": "1.2a-dev",
+        "version": "1.2b-dev",
         "symbol": sym,
         "analyzed_at": hit_row["analyzed_at"],
         "market": market,

@@ -65,3 +65,11 @@ A 401/403 is a question about the request before the key: verify the surrogate h
 - `build_levels(action, price, research)`: volatility-adaptive when research is present — stop = 1.5x ATR, T1 = 1.5R, T2 = swing structure in the trade direction or 3R; `levels_basis` records `atr_1.5x_4h` / `atr_1.5x_1d`. Falls back to v1.1 fixed percentages (`fixed_v1.1`) when the layer degrades.
 - Env overrides: `JEV_PINETS_CLI`, `JEV_RESEARCH_PINE`.
 - Deploy: copy `market-brief/jev_analyze.py` → `~/workspace/skills/jev-sentiment/bin/jev_analyze.py` and re-apply the DATA_DIR patch (`SCRIPT_DIR/../data`); copy `research/research.pine` → `~/workspace/skills/jev-sentiment/research/research.pine`.
+
+## v1.2b (dev branch)
+
+- Real keyless funding rates for crypto (BTC, ETH, SOL, HYPE, NEAR): `fetch_funding_rate()` tries Binance `/fapi/v1/fundingRate` (official, keyless; geo-blocked from this egress with HTTP 451 — never circumvented, falls through) → Hyperliquid `metaAndAssetCtxs` (keyless POST; hourly decimal normalized to %/8h) → the v1.2a change-based estimate as fallback.
+- `funding_rate_pct` is percent per 8h (Binance convention). Provenance rides along in the market dict: `funding_source` (binance|hyperliquid|estimated|none), `funding_asof`, `funding_age_s`, `funding_estimated`. Stocks/ETFs stay at 0.0 (`none` — no perps exist).
+- Jev market context includes funding provenance; the trade-action and squeeze questions tell the model to weigh real venue funding seriously and discount estimates.
+- Deterministic squeeze overlay (real funding only): funding ≤ -0.05%/8h floors `squeeze_risk_pct` at 65 (crowded shorts); funding ≥ +0.10%/8h records a `funding_squeeze_note` (crowded longs, long-squeeze risk).
+- Env override: `JEV_FUNDING_DISABLE=1` forces the estimated fallback (for testing failure paths).
