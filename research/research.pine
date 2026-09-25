@@ -1,0 +1,26 @@
+//@version=6
+// Jev research layer: proof-of-concept features for the Jev decision state.
+// Runs under PineTS (LuxAlgo) outside TradingView. Uses confirmed pivots only (no repaint on closed bars).
+indicator("Jev Research Layer", overlay=true)
+atr = ta.atr(14)
+[st, dir] = ta.supertrend(3, 10)          // dir < 0 = uptrend (Pine convention)
+ph = ta.pivothigh(high, 5, 5)
+pl = ta.pivotlow(low, 5, 5)
+var float lastHigh = na
+var float lastLow = na
+if not na(ph)
+    lastHigh := ph
+if not na(pl)
+    lastLow := pl
+bos_up = ta.crossover(close, lastHigh)     // break of structure up
+bos_dn = ta.crossunder(close, lastLow)     // break of structure down
+mfm = high != low ? ((close - low) - (high - close)) / (high - low) : 0.0
+cmf = math.sum(mfm * volume, 20) / math.sum(volume, 20)   // Chaikin Money Flow (your validated leg)
+plot(atr, "ATR")
+plot(st, "Supertrend")
+plot(dir, "TrendDir")
+plot(lastHigh, "SwingHigh")
+plot(lastLow, "SwingLow")
+plot(cmf, "CMF")
+plot(bos_up ? 1 : 0, "BOS_Up")
+plot(bos_dn ? 1 : 0, "BOS_Down")
