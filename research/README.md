@@ -46,4 +46,10 @@ The Pine runtime used by this directory (LuxAlgo PineTS / pinets-cli) is
   `research.pine`.
 - Note: when extracting features, skip the last bar of Kraken OHLC (forming
   interval) — or better, drop it before invoking the CLI (timeframe-aware).
-- Stooq daily CSV check for stock bars: pending.
+- 2026-09-25: stock path validated — Yahoo Finance chart API (keyless)
+  returned 251 daily COIN bars; `research.pine` computed ATR=11.75,
+  Supertrend=164.59, TrendDir=-1 (uptrend, consistent with the verified sign
+  convention), CMF≈0. Stooq's CSV endpoint timed out from this environment,
+  so Yahoo is the stock-bars source (docs updated accordingly).
+- TODO for v1.2a: `research.pine` still needs an `RSI(14)` plot for the stock
+  path (gap #2: stocks currently get RSI=50.0 neutral).
