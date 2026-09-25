@@ -56,3 +56,12 @@ A 401/403 is a question about the request before the key: verify the surrogate h
 - Hit-rate log `data/hit_rate.jsonl` + `--settle` mode (`--settle-prices` for stocks/ETFs). Misses labeled in place.
 - Identical for crypto and stocks/ETFs; stock prices still via `--price` from free public quotes.
 - Outside the Hatch runtime, creds fall back to `TWITTERAPI_IO_KEY` / `TYPESAFE_API_KEY` env vars.
+
+## v1.2a (dev branch)
+
+- Pine research layer: `research/research.pine` (ATR-14, Supertrend, confirmed 5/5 pivots, swing high/low, CMF-20, RSI-14, BOS flags) runs through LuxAlgo **pinets-cli as a separate OS process** (`.pine` in, JSON out on stdout; AGPL-3.0 boundary — never import pinets into the CLI). See `research/README.md`.
+- Crypto: Kraken 4h OHLC (forming candle dropped) → research features as **context** in the Jev state (`market.research`: atr_pct, trend, cmf_20, rsi, bos — max 5 features), never standalone signals.
+- Stocks/ETFs: real daily RSI-14 from Yahoo Finance chart bars (keyless), replacing the hardcoded 50.0. Last bar dropped only when it is today's still-forming session.
+- `build_levels(action, price, research)`: volatility-adaptive when research is present — stop = 1.5x ATR, T1 = 1.5R, T2 = swing structure in the trade direction or 3R; `levels_basis` records `atr_1.5x_4h` / `atr_1.5x_1d`. Falls back to v1.1 fixed percentages (`fixed_v1.1`) when the layer degrades.
+- Env overrides: `JEV_PINETS_CLI`, `JEV_RESEARCH_PINE`.
+- Deploy: copy `market-brief/jev_analyze.py` → `~/workspace/skills/jev-sentiment/bin/jev_analyze.py` and re-apply the DATA_DIR patch (`SCRIPT_DIR/../data`); copy `research/research.pine` → `~/workspace/skills/jev-sentiment/research/research.pine`.

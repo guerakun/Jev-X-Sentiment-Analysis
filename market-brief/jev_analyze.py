@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Jev X sentiment analysis for one symbol (crypto or stock/ETF) — v1.1 dev.
+"""Jev X sentiment analysis for one symbol (crypto or stock/ETF) — v1.2a dev.
 
 Applies to BOTH crypto and stocks/ETFs: crypto market data comes from Kraken
 public REST; stock/ETF prices come from free public quote data passed via
@@ -24,6 +24,18 @@ v1.1 adds, per the Musebook design thread (Turbo, Mikey, muchi, Z):
   5. Hit-rate log: every run appends a predicted-direction row to
      data/hit_rate.jsonl; --settle fills in actuals ~24h later and scores
      hits/misses. Misses are the labeled dataset for round two.
+
+v1.2a adds the Pine research layer (LuxAlgo pinets-cli, AGPL-3.0, run as a
+separate process — .pine in, JSON out; never imported):
+  1. ATR(14), Supertrend trend, CMF(20), RSI(14), BOS flags, swing high/low
+     computed from real OHLCV (Kraken 4h for crypto, Yahoo daily for stocks)
+     and merged into the Jev state as *context* (max 5 features), never as
+     standalone signals.
+  2. build_levels() is volatility-adaptive: stop = 1.5x ATR, T1 = 1.5R,
+     T2 = structure (swing high/low) or 3R — replacing the fixed
+     -3.8%/+4.5%/+8.5% for every asset.
+  3. Stocks/ETFs get a real daily RSI-14 (was hardcoded 50.0).
+Real funding rates remain estimated in v1.2a (v1.2b workstream).
 
 Pipeline (unchanged from v1.0):
   1. Market data: direct Kraken public REST for crypto (urllib, no key):
@@ -52,10 +64,13 @@ Output: JSON decision object on stdout.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -83,6 +98,20 @@ TWITTER_API_URL = "https://api.twitterapi.io/twitter/tweet/advanced_search"
 TWITTER_HOSTS = ("api.twitterapi.io",)
 TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
 TYPESAFE_HOSTS = ("api.typesafe.ai",)
+
+# v1.2a: Pine research layer (LuxAlgo pinets-cli, AGPL-3.0). It runs as a
+# SEPARATE OS process — .pine file in, JSON on stdout out. Never `import
+# pinets` here; linking AGPL code would contaminate this file's license.
+# See research/README.md for the boundary. Overrides for other environments:
+#   JEV_PINETS_CLI    path to the pinets-cli binary
+#   JEV_RESEARCH_PINE path to research.pine
+PINETS_CLI = os.environ.get("JEV_PINETS_CLI") or os.path.expanduser(
+    "~/workspace/.tools/pinets-cli/node_modules/.bin/pinets-cli")
+PINE_SCRIPT = os.environ.get("JEV_RESEARCH_PINE") or os.path.join(
+    SCRIPT_DIR, "..", "research", "research.pine")
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
+RESEARCH_FEATURES = ("ATR", "Supertrend", "TrendDir", "SwingHigh", "SwingLow",
+                     "CMF", "RSI", "BOS_Up", "BOS_Down")
 
 SYMBOL_NAMES = {
     "BTC": "Bitcoin", "ETH": "Ethereum", "SOL": "Solana", "HYPE": "Hyperliquid",
@@ -463,6 +492,23 @@ def fetch_market(symbol: str) -> dict:
         rsi = calculate_rsi(closes, 14)
 
         funding = 0.010 if change_24h > 3 else (-0.015 if change_24h < -3 else 0.005)
+
+        # v1.2a: Pine research layer over Kraken 4h bars (closed bars only —
+        # Kraken's last OHLC candle is the forming interval, so drop it).
+        research = None
+        try:
+            h4 = kraken_get("OHLC", {"pair": pair, "interval": 240})
+            h4key = next(iter(h4["result"]))
+            raw = h4["result"][h4key]
+            bars4h = [{"openTime": int(c[0]), "open": float(c[1]),
+                       "high": float(c[2]), "low": float(c[3]),
+                       "close": float(c[4]), "volume": float(c[6])}
+                      for c in raw[:-1]]
+            feats = run_research(bars4h)
+            research = compact_research(
+                feats, bars4h[-1]["close"] if bars4h else 0.0, "4h")
+        except Exception:
+            research = None  # research is context; the core read stands alone
         return {
             "symbol": sym,
             "price": round(price, 4) if price < 10 else round(price, 2),
@@ -472,6 +518,7 @@ def fetch_market(symbol: str) -> dict:
             "volume_24h_usd": round(volume_24h, 0),
             "rsi_14": rsi,
             "funding_rate_pct": round(funding, 4),
+            "research": research,
             "is_fallback": False,
             "source": "kraken",
         }
@@ -500,6 +547,108 @@ def calculate_rsi(prices: list[float], period: int = 14) -> float:
         return 100.0
     rs = avg_gain / avg_loss
     return round(100.0 - (100.0 / (1.0 + rs)), 2)
+
+
+# ---------------------------------------------------------------- v1.2a: Pine research layer
+
+def run_research(bars: list[dict]) -> dict | None:
+    """Run research.pine over OHLCV bars via pinets-cli as a separate process.
+
+    bars: [{openTime, open, high, low, close, volume}, ...] oldest-first,
+    closed bars only (caller drops the forming bar — timeframe-aware).
+    Returns {plot_name: latest_value} or None when the layer is unavailable;
+    the caller then degrades gracefully (fixed levels, neutral RSI) rather
+    than failing the whole run — research is context, not the core read.
+    """
+    if not (os.path.exists(PINETS_CLI) and os.path.exists(PINE_SCRIPT)):
+        return None
+    if len(bars) < 30:
+        return None
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    try:
+        json.dump(bars, tmp)
+        tmp.close()
+        proc = subprocess.run(
+            [PINETS_CLI, "run", PINE_SCRIPT, "-d", tmp.name, "-q"],
+            capture_output=True, text=True, timeout=180)
+        if proc.returncode != 0:
+            return None
+        plots = json.loads(proc.stdout).get("plots", {})
+        feats: dict = {}
+        for name, plot in plots.items():
+            if name.startswith("__") or name not in RESEARCH_FEATURES:
+                continue
+            vals = [p["value"] for p in plot.get("data", [])
+                    if p.get("value") is not None]
+            if vals:
+                feats[name] = vals[-1]
+        return feats or None
+    except Exception:
+        return None
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+def compact_research(feats: dict | None, last_close: float,
+                     timeframe: str) -> dict | None:
+    """Project Pine features to the <=5-feature research context for Jev."""
+    if not feats or not last_close:
+        return None
+    atr = feats.get("ATR")
+    trend_dir = feats.get("TrendDir", 0)
+    bos_up = bool(feats.get("BOS_Up"))
+    bos_dn = bool(feats.get("BOS_Down"))
+    return {
+        "timeframe": timeframe,
+        "atr_pct": round(atr / last_close * 100, 2) if atr else None,
+        "trend": "up" if trend_dir < 0 else ("down" if trend_dir > 0 else "flat"),
+        "cmf_20": round(feats["CMF"], 4) if feats.get("CMF") is not None else None,
+        "rsi": round(feats["RSI"], 1) if feats.get("RSI") is not None else None,
+        "bos": "up" if bos_up else ("down" if bos_dn else "none"),
+        "swing_high": feats.get("SwingHigh"),
+        "swing_low": feats.get("SwingLow"),
+    }
+
+
+def fetch_yahoo_daily_bars(symbol: str) -> list[dict]:
+    """Daily OHLCV bars for a stock/ETF via Yahoo Finance chart API (keyless).
+
+    Drops the last bar only when it is today's still-forming session
+    (timeframe-aware: closed daily sessions are kept).
+    """
+    url = (f"{YAHOO_CHART_URL}/{urllib.parse.quote(symbol)}"
+           f"?interval=1d&range=1y")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"yahoo bars fetch failed for {symbol}: {e}")
+    try:
+        r = payload["chart"]["result"][0]
+        q = r["indicators"]["quote"][0]
+        ts = r["timestamp"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"yahoo bars parse failed for {symbol}: {e}")
+    bars = []
+    for i, t in enumerate(ts):
+        if q["close"][i] is None:
+            continue
+        bars.append({"openTime": t, "open": q["open"][i], "high": q["high"][i],
+                     "low": q["low"][i], "close": q["close"][i],
+                     "volume": q["volume"][i] or 0})
+    if bars:
+        today = datetime.datetime.now(datetime.timezone.utc).date()
+        last_day = datetime.datetime.fromtimestamp(
+            bars[-1]["openTime"], tz=datetime.timezone.utc).date()
+        if last_day >= today:
+            bars = bars[:-1]  # today's session still forming
+    if len(bars) < 30:
+        raise RuntimeError(f"too few yahoo bars for {symbol}: {len(bars)}")
+    return bars
 
 
 def process_tweets(tweets: list[dict]) -> dict:
@@ -595,6 +744,14 @@ def typesafe_evaluate(symbol: str, market: dict, stats: dict, calls: list[dict])
             "rsi_14": market["rsi_14"],
             "funding_rate_pct": market["funding_rate_pct"],
             "volume_24h_usd": market["volume_24h_usd"],
+            # v1.2a: Pine research features as *context* (never signals):
+            # atr_pct = ATR as % of price, trend from Supertrend,
+            # cmf_20 = Chaikin money flow, rsi = same-timeframe RSI,
+            # bos = break-of-structure flag. Absent when the layer degraded.
+            "research": ({k: v for k, v in (market.get("research") or {}).items()
+                          if k in ("timeframe", "atr_pct", "trend", "cmf_20",
+                                   "rsi", "bos")}
+                         or None),
         },
         "social_stats": {
             "sample_size": stats["sample_size"],
@@ -611,6 +768,9 @@ def typesafe_evaluate(symbol: str, market: dict, stats: dict, calls: list[dict])
             "instructions": (
                 "Given `market` data (RSI, price change, funding rate) and `social_stats` "
                 "across `sample_size` tweets, what is the best immediate trading action for `asset`? "
+                "When `market.research` is present, its Pine-derived features (atr_pct, trend, "
+                "cmf_20, rsi, bos) are volatility/structure CONTEXT for sizing risk — not "
+                "standalone trade signals; weigh them well below social + price evidence."
             ) + author_guidance,
             "criteria": {
                 "STRONG_BUY": "High-conviction long (e.g. short squeeze setup, capitulation bottom, or major verified breakout).",
@@ -696,7 +856,17 @@ def typesafe_evaluate(symbol: str, market: dict, stats: dict, calls: list[dict])
     }
 
 
-def build_levels(action: str, price: float) -> dict:
+def build_levels(action: str, price: float,
+                 research: dict | None = None) -> dict:
+    """Trade levels around the current price.
+
+    v1.2a: when Pine research features are available, levels are
+    volatility-adaptive — stop = 1.5x ATR, T1 = 1.5R, T2 = confirmed swing
+    structure in the trade direction or 3R when structure is absent/invalid.
+    Without research, falls back to the v1.1 fixed percentages.
+    """
+    if research and research.get("atr_pct"):
+        return _build_levels_atr(action, price, research)
     if action in ("STRONG_BUY", "BUY"):
         entry = [round(price * 0.995, 2), round(price * 1.002, 2)]
         sl, tp1, tp2 = price * 0.962, price * 1.045, price * 1.085
@@ -709,6 +879,11 @@ def build_levels(action: str, price: float) -> dict:
     else:
         entry = [price, price]
         sl, tp1, tp2 = price * 0.95, price * 1.05, price * 1.10
+    return _fixed_levels_dict(price, entry, sl, tp1, tp2, basis="fixed_v1.1")
+
+
+def _fixed_levels_dict(price: float, entry: list, sl: float, tp1: float,
+                       tp2: float, basis: str) -> dict:
     sl, tp1, tp2 = round(sl, 2), round(tp1, 2), round(tp2, 2)
     sl_pct = round((sl - price) / price * 100, 2)
     tp2_pct = round((tp2 - price) / price * 100, 2)
@@ -717,7 +892,49 @@ def build_levels(action: str, price: float) -> dict:
         "target_1": tp1, "target_1_pct": round((tp1 - price) / price * 100, 2),
         "target_2": tp2, "target_2_pct": tp2_pct,
         "risk_reward_ratio": round(abs(tp2_pct / sl_pct), 2) if sl_pct else 2.5,
+        "levels_basis": basis,
     }
+
+
+def _build_levels_atr(action: str, price: float, research: dict) -> dict:
+    """Volatility-adaptive levels: stop = 1.5x ATR, T1 = 1.5R, T2 = swing
+    structure in the trade direction when it sits beyond T1, else 3R."""
+    atr_pct = research["atr_pct"]  # ATR as % of price
+    basis = f"atr_1.5x_{research.get('timeframe', '?')}"
+
+    def entry_zone() -> list:
+        w = 0.25 * atr_pct  # entry zone: +/-0.25 ATR around price
+        return [round(price * (1 - w / 100), 2),
+                round(price * (1 + w / 100), 2)]
+
+    if action in ("STRONG_BUY", "BUY"):
+        r = 1.5 * atr_pct
+        sl_pct, tp1_pct = -r, 1.5 * r
+        struct = research.get("swing_high")
+        struct_pct = ((struct - price) / price * 100
+                      if struct and struct > price else None)
+        tp2_pct = (struct_pct if struct_pct is not None and struct_pct > tp1_pct
+                   else 3.0 * r)
+        entry = entry_zone()
+    elif action in ("SELL", "STRONG_SELL"):
+        r = 1.5 * atr_pct
+        sl_pct, tp1_pct = r, -1.5 * r
+        struct = research.get("swing_low")
+        struct_pct = ((struct - price) / price * 100
+                      if struct and struct < price else None)
+        tp2_pct = (struct_pct if struct_pct is not None and struct_pct < tp1_pct
+                   else -3.0 * r)
+        entry = entry_zone()
+    elif action == "TAKE_PROFIT":
+        sl_pct, tp1_pct, tp2_pct = -1.0 * atr_pct, 1.0 * atr_pct, 2.0 * atr_pct
+        entry = [round(price * (1 - 0.1 * atr_pct / 100), 2), round(price, 2)]
+    else:  # HOLD
+        sl_pct, tp1_pct, tp2_pct = -1.5 * atr_pct, 1.5 * atr_pct, 3.0 * atr_pct
+        entry = [round(price, 2), round(price, 2)]
+    sl = price * (1 + sl_pct / 100)
+    tp1 = price * (1 + tp1_pct / 100)
+    tp2 = price * (1 + tp2_pct / 100)
+    return _fixed_levels_dict(price, entry, sl, tp1, tp2, basis=basis)
 
 # ---------------------------------------------------------------- v1.1: per-call template, falsifier, hit-rate
 
@@ -920,7 +1137,20 @@ def main() -> None:
     sym = args.symbol.upper().replace("$", "")
     if args.price is not None:
         # Stock/ETF path: Kraken has no stock pairs, so the caller supplies the
-        # price from the free public quote. RSI/funding default to neutral.
+        # price from the free public quote. v1.2a: real daily RSI-14 and Pine
+        # research features come from Yahoo Finance chart bars (keyless);
+        # funding stays neutral (no perps for stocks).
+        research = None
+        rsi_14 = 50.0
+        try:
+            bars1d = fetch_yahoo_daily_bars(sym)
+            feats = run_research(bars1d)
+            research = compact_research(
+                feats, bars1d[-1]["close"] if bars1d else 0.0, "1d")
+            if research and research.get("rsi") is not None:
+                rsi_14 = research["rsi"]
+        except Exception:
+            research = None  # degrade to neutral; the core read stands alone
         market = {
             "symbol": sym,
             "price": args.price,
@@ -928,8 +1158,9 @@ def main() -> None:
             "high_24h": None,
             "low_24h": None,
             "volume_24h_usd": 0,
-            "rsi_14": 50.0,
+            "rsi_14": rsi_14,
             "funding_rate_pct": 0.0,
+            "research": research,
             "is_fallback": False,
             "source": "provided",
         }
@@ -943,7 +1174,8 @@ def main() -> None:
     calls = build_calls(stats["stratified_sample"], priors, sym)
 
     decision = typesafe_evaluate(sym, market, stats, calls)
-    decision["trade_levels"] = build_levels(decision["action"], market["price"])
+    decision["trade_levels"] = build_levels(decision["action"], market["price"],
+                                            market.get("research"))
 
     # v1.1: fold this run into the rolling priors AFTER scoring.
     update_author_priors(priors, sym, tw["tweets"])
@@ -967,7 +1199,7 @@ def main() -> None:
 
     out = {
         "ok": True,
-        "version": "1.1-dev",
+        "version": "1.2a-dev",
         "symbol": sym,
         "analyzed_at": hit_row["analyzed_at"],
         "market": market,

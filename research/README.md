@@ -53,3 +53,16 @@ The Pine runtime used by this directory (LuxAlgo PineTS / pinets-cli) is
   so Yahoo is the stock-bars source (docs updated accordingly).
 - TODO for v1.2a: `research.pine` still needs an `RSI(14)` plot for the stock
   path (gap #2: stocks currently get RSI=50.0 neutral).
+
+## Implementation status (2026-09-25, v1.2a)
+
+`market-brief/jev_analyze.py` now wires this layer in:
+
+- **Crypto:** Kraken 4h OHLC → `run_research()` (pinets-cli subprocess) → `compact_research()` → `market["research"]`. The forming 4h candle is dropped before the run.
+- **Stocks/ETFs:** Yahoo Finance daily chart bars (keyless) → same pipeline; the daily RSI-14 replaces the old hardcoded `50.0`. Only today's still-forming session bar is dropped.
+- **Jev state:** `market.research` carries at most 5 features (`timeframe, atr_pct, trend, cmf_20, rsi, bos`) as *context*, with prompt wording that they are not standalone signals.
+- **`build_levels()`:** volatility-adaptive when research is present — stop = 1.5x ATR, T1 = 1.5R, T2 = swing structure (validated: beyond T1 in the trade direction) else 3R. `levels_basis` tags `atr_1.5x_4h` / `atr_1.5x_1d` vs `fixed_v1.1`.
+- Degrades gracefully: if pinets-cli is missing or a run fails, research is `None` and the pipeline falls back to v1.1 fixed levels / neutral RSI — the core sentiment read never dies on research-layer trouble.
+- Env overrides: `JEV_PINETS_CLI`, `JEV_RESEARCH_PINE`.
+
+Funding rates remain estimated in v1.2a (v1.2b workstream).
